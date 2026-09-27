@@ -2,8 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    env,
-    fs,
+    env, fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
@@ -199,7 +198,10 @@ fn manifest_path() -> Result<PathBuf> {
         return Ok(local);
     }
 
-    return Ok(home_dir()?.join(".giw").join("desktop").join("manifest.yaml"));
+    return Ok(home_dir()?
+        .join(".giw")
+        .join("desktop")
+        .join("manifest.yaml"));
 }
 
 fn validate_loopback_bind(raw: &str) -> Result<SocketAddr> {
@@ -208,7 +210,10 @@ fn validate_loopback_bind(raw: &str) -> Result<SocketAddr> {
         .with_context(|| format!("GIW_DESKTOP_BIND must be a socket address; got {raw:?}"))?;
 
     if !bind.ip().is_loopback() {
-        bail!("GIW desktop daemon must bind to loopback; got {}", bind.ip());
+        bail!(
+            "GIW desktop daemon must bind to loopback; got {}",
+            bind.ip()
+        );
     }
 
     return Ok(bind);
@@ -216,7 +221,10 @@ fn validate_loopback_bind(raw: &str) -> Result<SocketAddr> {
 
 fn validate_manifest(manifest: &DesktopManifest) -> Result<()> {
     if manifest.version != 1 {
-        bail!("unsupported GIW desktop manifest version {}; expected 1", manifest.version);
+        bail!(
+            "unsupported GIW desktop manifest version {}; expected 1",
+            manifest.version
+        );
     }
 
     let mut names = std::collections::HashSet::new();
@@ -281,7 +289,10 @@ fn load_or_create_token(path: &Path) -> Result<String> {
     if let Ok(raw) = fs::read_to_string(path) {
         let token = raw.trim();
         if token.len() < 32 || token.chars().any(char::is_whitespace) {
-            bail!("existing GIW desktop token is malformed at {}", path.display());
+            bail!(
+                "existing GIW desktop token is malformed at {}",
+                path.display()
+            );
         }
         return Ok(token.to_string());
     }
@@ -289,10 +300,15 @@ fn load_or_create_token(path: &Path) -> Result<String> {
     let parent = path
         .parent()
         .context("GIW desktop token path has no parent directory")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
 
-    let token = format!("{}{}{}{}", Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let token = format!(
+        "{}{}{}{}",
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4()
+    );
     fs::write(path, format!("{token}\n"))
         .with_context(|| format!("failed to write {}", path.display()))?;
 
@@ -320,11 +336,18 @@ fn require_auth(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
 }
 
 fn service_spec<'a>(state: &'a AppState, name: &str) -> Result<&'a ServiceSpec, ApiError> {
-    if let Some(service) = state.manifest.services.iter().find(|service| service.name == name) {
+    if let Some(service) = state
+        .manifest
+        .services
+        .iter()
+        .find(|service| service.name == name)
+    {
         return Ok(service);
     }
 
-    return Err(ApiError::not_found(format!("unknown desktop service {name:?}")));
+    return Err(ApiError::not_found(format!(
+        "unknown desktop service {name:?}"
+    )));
 }
 
 fn command_for_service(service: &ServiceSpec) -> Command {
@@ -389,7 +412,9 @@ async fn start_service_internal(state: &AppState, name: &str) -> Result<ProcessS
     if let Some(child) = processes.get_mut(name) {
         match child.try_wait() {
             Ok(None) => {
-                return Err(ApiError::conflict(format!("service {name:?} is already running")));
+                return Err(ApiError::conflict(format!(
+                    "service {name:?} is already running"
+                )));
             }
             Ok(Some(_)) | Err(_) => {
                 processes.remove(name);
@@ -535,7 +560,13 @@ async fn start_tunnel(
     }
 
     let mut command = Command::new("cloudflared");
-    command.args(["tunnel", "--url", spec.service_url.as_str(), "run", spec.name.as_str()]);
+    command.args([
+        "tunnel",
+        "--url",
+        spec.service_url.as_str(),
+        "run",
+        spec.name.as_str(),
+    ]);
     command.stdin(Stdio::null());
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
@@ -639,7 +670,9 @@ async fn apply_update(
         .map_err(ApiError::internal)?;
 
     if !status.success() {
-        return Err(ApiError::internal(format!("update plan exited with {status}")));
+        return Err(ApiError::internal(format!(
+            "update plan exited with {status}"
+        )));
     }
 
     return Ok(Json(json!({"updated": true})));
