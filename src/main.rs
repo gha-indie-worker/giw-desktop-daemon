@@ -548,7 +548,7 @@ async fn start_tunnel(
         .manifest
         .tunnel
         .as_ref()
-        .ok_or_else(|| ApiError::not_found("desktop manifest has no Cloudflare tunnel"))?
+        .ok_or_else(|| ApiError::bad_request("desktop manifest has no Cloudflare tunnel"))?
         .clone();
 
     let mut tunnel = state.tunnel.lock().await;
