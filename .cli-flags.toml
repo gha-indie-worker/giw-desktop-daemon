@@ -1,0 +1,20 @@
+[help]
+url = "https://github.com/gha-indie-worker/giw-desktop-daemon"
+columns = ["options", "env", "type", "default", "description"]
+
+[parse]
+stop_at_first_positional = false
+allow_unknown = false
+
+[flags.config]
+env = "GIW_DESKTOP_CONFIG"
+aliases = ["config"]
+type = "string"
+help = "Path to the canonical giw-desktop-infra TOML configuration."
+
+[flags.log]
+env = "GIW_DESKTOP_LOG"
+aliases = ["log"]
+type = "string"
+default = "giw_desktop_daemon=info"
+help = "Tracing filter for the local GIW control plane."
