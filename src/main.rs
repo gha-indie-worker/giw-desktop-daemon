@@ -20,6 +20,7 @@ use std::{
 use uuid::Uuid;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8770";
+const SCINTILLA_DESKTOP_PROTOCOL: &str = "scintilla.desktop-daemon/v1";
 const DEFAULT_SCINTILLA_URL: &str = "http://127.0.0.1:8765";
 const MAX_JOB_TIMEOUT_SECS: u64 = 6 * 60 * 60;
 const MAX_REPOSITORY_CHARS: usize = 256;
@@ -188,6 +189,8 @@ async fn dispatch_job(
             state.scintilla_url.trim_end_matches('/')
         ))
         .bearer_auth(state.scintilla_token.as_ref())
+        .header("x-ores-protocol-version", SCINTILLA_DESKTOP_PROTOCOL)
+        .header("x-ores-idempotency-key", execution_id.as_str())
         .json(&payload)
         .send()
         .await
@@ -338,6 +341,7 @@ async fn fetch_scintilla_status(state: &AppState) -> Result<Value, (StatusCode, 
             state.scintilla_url.trim_end_matches('/')
         ))
         .bearer_auth(state.scintilla_token.as_ref())
+        .header("x-ores-protocol-version", SCINTILLA_DESKTOP_PROTOCOL)
         .send()
         .await
         .map_err(bad_gateway)?;
@@ -564,6 +568,14 @@ mod tests {
             timeout_secs: 3600,
             execution_os: ExecutionOs::Linux,
         }
+    }
+
+    #[test]
+    fn scintilla_protocol_contract_is_explicit() {
+        assert_eq!(SCINTILLA_DESKTOP_PROTOCOL, "scintilla.desktop-daemon/v1");
+        let source = include_str!("main.rs");
+        assert!(source.contains("x-ores-protocol-version"));
+        assert!(source.contains("x-ores-idempotency-key"));
     }
 
     #[test]
