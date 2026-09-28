@@ -30,3 +30,20 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all-targets
+      - name: Generate deterministic lock candidate
+        if: always()
+        run: cargo generate-lockfile
+      - name: Preserve lock candidate
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cargo-lock-candidate
+          path: Cargo.lock
+          if-no-files-found: error
+      - name: Require committed deterministic lockfile
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git ls-files --error-unmatch Cargo.lock
+          git diff --exit-code -- Cargo.lock
