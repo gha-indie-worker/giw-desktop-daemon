@@ -10,12 +10,17 @@ repository = "https://github.com/gha-indie-worker/giw-desktop-daemon"
 [lints.rust]
 unsafe_code = "deny"
 
+[lints.clippy]
+needless_return = "allow"
+
 [dependencies]
 anyhow = "1"
+flags2env = { git = "https://github.com/ORESoftware/flags-2-env.git", rev = "5a44d6a38f06c2765e80676618fd72bf4e59b984" }
 axum = { version = "0.8", features = ["json"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
