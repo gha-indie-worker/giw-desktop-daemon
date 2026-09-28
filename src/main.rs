@@ -10,6 +10,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    fs::{self, OpenOptions},
+    io::{ErrorKind, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -24,6 +26,7 @@ const MAX_REPOSITORY_CHARS: usize = 256;
 const MAX_REF_CHARS: usize = 256;
 const MAX_JOB_NAME_CHARS: usize = 128;
 const MAX_UPSTREAM_BODY_BYTES: usize = 1024 * 1024;
+const MAX_TOKEN_FILE_BYTES: u64 = 4096;
 
 #[derive(Clone)]
 struct AppState {
@@ -83,9 +86,7 @@ async fn main() -> Result<()> {
         .get("RUST_LOG")
         .map(String::as_str)
         .unwrap_or("giw_desktop_daemon=info");
-    tracing_subscriber::fmt()
-        .with_env_filter(log_filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(log_filter).init();
 
     let addr = parse_loopback_addr(
         env.get("GIW_DESKTOP_ADDR")
@@ -236,11 +237,7 @@ fn validate_dispatch(request: &DispatchJobRequest) -> Result<(), (StatusCode, St
     Ok(())
 }
 
-fn validate_bounded(
-    name: &str,
-    value: &str,
-    max_chars: usize,
-) -> Result<(), (StatusCode, String)> {
+fn validate_bounded(name: &str, value: &str, max_chars: usize) -> Result<(), (StatusCode, String)> {
     if value.trim().is_empty()
         || value.chars().count() > max_chars
         || value.chars().any(char::is_control)
@@ -262,7 +259,10 @@ fn validate_repository(value: &str) -> Result<(), (StatusCode, String)> {
         || !safe_repo_segment(repo, 100)
         || value.contains("..")
     {
-        return Err((StatusCode::BAD_REQUEST, "repository must be a safe owner/name identifier".to_owned()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "repository must be a safe owner/name identifier".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -285,23 +285,25 @@ fn validate_git_ref(value: &str) -> Result<(), (StatusCode, String)> {
         || value.contains('\\')
         || value.chars().any(char::is_whitespace)
     {
-        return Err((StatusCode::BAD_REQUEST, "git_ref contains unsafe ref syntax".to_owned()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "git_ref contains unsafe ref syntax".to_owned(),
+        ));
     }
     Ok(())
 }
 
-fn validate_pathish(
-    name: &str,
-    value: &str,
-    max_chars: usize,
-) -> Result<(), (StatusCode, String)> {
+fn validate_pathish(name: &str, value: &str, max_chars: usize) -> Result<(), (StatusCode, String)> {
     validate_bounded(name, value, max_chars)?;
     if value.starts_with('/')
         || value.contains("..")
         || value.contains('\\')
         || value.chars().any(char::is_whitespace)
     {
-        return Err((StatusCode::BAD_REQUEST, format!("{name} contains unsafe path syntax")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{name} contains unsafe path syntax"),
+        ));
     }
     Ok(())
 }
@@ -312,7 +314,10 @@ fn validate_label(value: &str) -> Result<(), (StatusCode, String)> {
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
     {
-        return Err((StatusCode::BAD_REQUEST, "label contains unsupported characters".to_owned()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "label contains unsupported characters".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -349,9 +354,7 @@ fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, S
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    if provided
-        .is_some_and(|token| constant_time_eq(token.as_bytes(), state.token.as_bytes()))
-    {
+    if provided.is_some_and(|token| constant_time_eq(token.as_bytes(), state.token.as_bytes())) {
         return Ok(());
     }
     Err((StatusCode::UNAUTHORIZED, "unauthorized".to_owned()))
@@ -415,39 +418,88 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 fn read_scintilla_token(path: &Path) -> Result<String> {
-    let token = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read Scintilla daemon token at {}", path.display()))?;
+    read_token_file(path, "Scintilla daemon")
+}
+
+fn read_token_file(path: &Path, label: &str) -> Result<String> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("cannot stat {label} token at {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{label} token path must be a regular non-symlink file");
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_TOKEN_FILE_BYTES {
+        bail!("{label} token file size is invalid");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("{label} token file must not be accessible by group/other users");
+        }
+    }
+
+    let token = fs::read_to_string(path)
+        .with_context(|| format!("cannot read {label} token at {}", path.display()))?;
     let token = token.trim();
     if token.len() < 32 || token.len() > 4096 || token.chars().any(char::is_whitespace) {
-        bail!("Scintilla daemon token is invalid");
+        bail!("{label} token is invalid");
     }
     Ok(token.to_owned())
 }
 
 fn load_or_create_token(path: &Path) -> Result<String> {
-    if let Ok(token) = std::fs::read_to_string(path) {
-        let token = token.trim();
-        if token.len() >= 32 && token.len() <= 4096 && !token.chars().any(char::is_whitespace) {
-            return Ok(token.to_owned());
+    match read_token_file(path, "IndieBuild daemon") {
+        Ok(token) => return Ok(token),
+        Err(error) if !matches!(fs::symlink_metadata(path), Err(io_error) if io_error.kind() == ErrorKind::NotFound) => {
+            return Err(error);
         }
-        bail!("IndieBuild daemon token file is too short");
+        Err(_) => {}
     }
+
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("token path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    let token = format!(
-        "{}{}",
-        Uuid::new_v4().simple(),
-        Uuid::new_v4().simple()
-    );
-    std::fs::write(path, format!("{token}\n"))?;
+    fs::create_dir_all(parent)?;
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        match options.open(path) {
+            Ok(mut file) => {
+                file.write_all(format!("{token}\n").as_bytes())?;
+                file.sync_all()?;
+                return Ok(token);
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                return read_token_file(path, "IndieBuild daemon");
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
-    Ok(token)
+
+    #[cfg(not(unix))]
+    {
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        match options.open(path) {
+            Ok(mut file) => {
+                file.write_all(format!("{token}\n").as_bytes())?;
+                file.sync_all()?;
+                return Ok(token);
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                return read_token_file(path, "IndieBuild daemon");
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 async fn read_bounded_json(mut response: reqwest::Response, max_bytes: usize) -> Result<Value> {
@@ -486,7 +538,6 @@ fn bad_gateway(error: impl std::fmt::Display) -> (StatusCode, String) {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -539,5 +590,34 @@ mod tests {
         assert!(constant_time_eq(b"abcdef", b"abcdef"));
         assert!(!constant_time_eq(b"abcdef", b"abcdeg"));
         assert!(!constant_time_eq(b"short", b"shorter"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_reader_rejects_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = std::env::temp_dir().join(format!("giw-token-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create token test dir");
+        let target = root.join("target");
+        fs::write(&target, "abcdefghijklmnopqrstuvwxyz0123456789\n").expect("write target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("chmod target");
+        let link = root.join("token");
+        symlink(&target, &link).expect("create token symlink");
+
+        assert!(read_token_file(&link, "test").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn token_creation_is_create_new_and_round_trips() {
+        let root = std::env::temp_dir().join(format!("giw-token-create-{}", Uuid::new_v4()));
+        let path = root.join("token");
+        let created = load_or_create_token(&path).expect("create token");
+        let loaded = load_or_create_token(&path).expect("load token");
+
+        assert_eq!(created, loaded);
+        assert!(created.len() >= 32);
+        let _ = fs::remove_dir_all(root);
     }
 }
