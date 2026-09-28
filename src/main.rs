@@ -1,14 +1,15 @@
+mod flags;
+
 use anyhow::{Context as _, Result, anyhow, bail};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    env,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -16,12 +17,13 @@ use std::{
 };
 use uuid::Uuid;
 
-const DEFAULT_ADDR: &str = "127.0.0.1:8756";
+const DEFAULT_ADDR: &str = "127.0.0.1:8770";
 const DEFAULT_SCINTILLA_URL: &str = "http://127.0.0.1:8765";
 const MAX_JOB_TIMEOUT_SECS: u64 = 6 * 60 * 60;
 const MAX_REPOSITORY_CHARS: usize = 256;
 const MAX_REF_CHARS: usize = 256;
 const MAX_JOB_NAME_CHARS: usize = 128;
+const MAX_UPSTREAM_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -76,26 +78,34 @@ struct DispatchJobResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let env = flags::apply_cli_flags().map_err(anyhow::Error::msg)?;
+    let log_filter = env
+        .get("RUST_LOG")
+        .map(String::as_str)
+        .unwrap_or("giw_desktop_daemon=info");
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "giw_desktop_daemon=info".into()),
-        )
+        .with_env_filter(log_filter)
         .init();
 
-    let addr =
-        parse_loopback_addr(env::var("GIW_DESKTOP_ADDR").as_deref().unwrap_or(DEFAULT_ADDR))?;
-    let scintilla_url =
-        env::var("GIW_SCINTILLA_DAEMON_URL").unwrap_or_else(|_| DEFAULT_SCINTILLA_URL.to_owned());
+    let addr = parse_loopback_addr(
+        env.get("GIW_DESKTOP_ADDR")
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_ADDR),
+    )?;
+    let scintilla_url = env
+        .get("GIW_SCINTILLA_DAEMON_URL")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_SCINTILLA_URL.to_owned());
     require_loopback_url(&scintilla_url)?;
 
     let state = AppState {
-        token: Arc::from(load_or_create_token(&giw_token_path()?)?),
-        scintilla_token: Arc::from(read_scintilla_token(&scintilla_token_path()?)?),
+        token: Arc::from(load_or_create_token(&giw_token_path(&env)?)?),
+        scintilla_token: Arc::from(read_scintilla_token(&scintilla_token_path(&env)?)?),
         scintilla_url: Arc::from(scintilla_url),
         client: reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?,
         started_at: Instant::now(),
     };
@@ -105,6 +115,7 @@ async fn main() -> Result<()> {
         .route("/v1/status", get(status))
         .route("/v1/jobs/dispatch", post(dispatch_job))
         .route("/v1/scintilla/status", get(scintilla_status))
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -182,19 +193,15 @@ async fn dispatch_job(
         .map_err(bad_gateway)?;
 
     let status = response.status();
-    let bytes = response.bytes().await.map_err(bad_gateway)?;
     if !status.is_success() {
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Scintilla desktop daemon returned {status}"),
         ));
     }
-    let raw = serde_json::from_slice::<Value>(&bytes).map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "Scintilla desktop daemon returned non-JSON".to_owned(),
-        )
-    })?;
+    let raw = read_bounded_json(response, MAX_UPSTREAM_BODY_BYTES)
+        .await
+        .map_err(bad_gateway)?;
 
     Ok(Json(DispatchJobResponse {
         execution_id,
@@ -206,14 +213,9 @@ async fn dispatch_job(
 
 fn validate_dispatch(request: &DispatchJobRequest) -> Result<(), (StatusCode, String)> {
     validate_bounded("repository", &request.repository, MAX_REPOSITORY_CHARS)?;
-    if !request.repository.contains('/') || request.repository.starts_with('/') {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "repository must be owner/name".to_owned(),
-        ));
-    }
-    validate_bounded("git_ref", &request.git_ref, MAX_REF_CHARS)?;
-    validate_bounded("workflow", &request.workflow, MAX_JOB_NAME_CHARS)?;
+    validate_repository(&request.repository)?;
+    validate_git_ref(&request.git_ref)?;
+    validate_pathish("workflow", &request.workflow, MAX_JOB_NAME_CHARS)?;
     validate_bounded("job", &request.job, MAX_JOB_NAME_CHARS)?;
 
     if request.timeout_secs == 0 || request.timeout_secs > MAX_JOB_TIMEOUT_SECS {
@@ -229,7 +231,7 @@ fn validate_dispatch(request: &DispatchJobRequest) -> Result<(), (StatusCode, St
         ));
     }
     for label in &request.labels {
-        validate_bounded("label", label, 64)?;
+        validate_label(label)?;
     }
     Ok(())
 }
@@ -251,6 +253,70 @@ fn validate_bounded(
     Ok(())
 }
 
+fn validate_repository(value: &str) -> Result<(), (StatusCode, String)> {
+    let mut parts = value.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || !safe_repo_segment(owner, 100)
+        || !safe_repo_segment(repo, 100)
+        || value.contains("..")
+    {
+        return Err((StatusCode::BAD_REQUEST, "repository must be a safe owner/name identifier".to_owned()));
+    }
+    Ok(())
+}
+
+fn safe_repo_segment(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn validate_git_ref(value: &str) -> Result<(), (StatusCode, String)> {
+    validate_bounded("git_ref", value, MAX_REF_CHARS)?;
+    if value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains("//")
+        || value.contains("..")
+        || value.contains("@{")
+        || value.contains('\\')
+        || value.chars().any(char::is_whitespace)
+    {
+        return Err((StatusCode::BAD_REQUEST, "git_ref contains unsafe ref syntax".to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_pathish(
+    name: &str,
+    value: &str,
+    max_chars: usize,
+) -> Result<(), (StatusCode, String)> {
+    validate_bounded(name, value, max_chars)?;
+    if value.starts_with('/')
+        || value.contains("..")
+        || value.contains('\\')
+        || value.chars().any(char::is_whitespace)
+    {
+        return Err((StatusCode::BAD_REQUEST, format!("{name} contains unsafe path syntax")));
+    }
+    Ok(())
+}
+
+fn validate_label(value: &str) -> Result<(), (StatusCode, String)> {
+    validate_bounded("label", value, 64)?;
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err((StatusCode::BAD_REQUEST, "label contains unsupported characters".to_owned()));
+    }
+    Ok(())
+}
+
 fn default_timeout_secs() -> u64 {
     60 * 60
 }
@@ -267,19 +333,15 @@ async fn fetch_scintilla_status(state: &AppState) -> Result<Value, (StatusCode, 
         .await
         .map_err(bad_gateway)?;
     let status = response.status();
-    let bytes = response.bytes().await.map_err(bad_gateway)?;
     if !status.is_success() {
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Scintilla desktop daemon returned {status}"),
         ));
     }
-    serde_json::from_slice::<Value>(&bytes).map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "Scintilla desktop daemon returned non-JSON".to_owned(),
-        )
-    })
+    read_bounded_json(response, MAX_UPSTREAM_BODY_BYTES)
+        .await
+        .map_err(bad_gateway)
 }
 
 fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
@@ -287,7 +349,9 @@ fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, S
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    if provided == Some(state.token.as_ref()) {
+    if provided
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), state.token.as_bytes()))
+    {
         return Ok(());
     }
     Err((StatusCode::UNAUTHORIZED, "unauthorized".to_owned()))
@@ -304,46 +368,57 @@ fn parse_loopback_addr(value: &str) -> Result<SocketAddr> {
 }
 
 fn require_loopback_url(value: &str) -> Result<()> {
-    let allowed = value.starts_with("http://127.0.0.1:")
-        || value.starts_with("http://localhost:")
-        || value.starts_with("http://[::1]:");
-    if !allowed {
-        bail!("GIW_SCINTILLA_DAEMON_URL must be loopback HTTP");
+    let url = reqwest::Url::parse(value).context("GIW_SCINTILLA_DAEMON_URL must be a valid URL")?;
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("GIW_SCINTILLA_DAEMON_URL must be credential-free loopback HTTP");
+    }
+    let host = url.host_str().unwrap_or_default();
+    if !matches!(host, "127.0.0.1" | "::1") {
+        bail!("GIW_SCINTILLA_DAEMON_URL must use a literal loopback address");
     }
     Ok(())
 }
 
-fn giw_token_path() -> Result<PathBuf> {
-    if let Ok(path) = env::var("GIW_DESKTOP_TOKEN_FILE") {
-        return expand_home(Path::new(&path));
+fn giw_token_path(env: &flags::EnvMap) -> Result<PathBuf> {
+    if let Some(path) = env.get("GIW_DESKTOP_TOKEN_FILE") {
+        return expand_home(Path::new(path));
     }
-    let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is required"))?;
-    Ok(PathBuf::from(home).join(".indiebuild/daemon/token"))
+    Ok(home_dir()?.join(".indiebuild/daemon/token"))
 }
 
-fn scintilla_token_path() -> Result<PathBuf> {
-    if let Ok(path) = env::var("GIW_SCINTILLA_TOKEN_FILE") {
-        return expand_home(Path::new(&path));
+fn scintilla_token_path(env: &flags::EnvMap) -> Result<PathBuf> {
+    if let Some(path) = env.get("GIW_SCINTILLA_TOKEN_FILE") {
+        return expand_home(Path::new(path));
     }
-    let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is required"))?;
-    Ok(PathBuf::from(home).join(".scintilla/daemon/token"))
+    Ok(home_dir()?.join(".scintilla/daemon/token"))
 }
 
 fn expand_home(path: &Path) -> Result<PathBuf> {
     let text = path.to_string_lossy();
     if text == "~" || text.starts_with("~/") {
-        let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is required"))?;
         let suffix = text.trim_start_matches('~').trim_start_matches('/');
-        return Ok(PathBuf::from(home).join(suffix));
+        return Ok(home_dir()?.join(suffix));
     }
     Ok(path.to_path_buf())
+}
+
+fn home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("HOME/USERPROFILE is required"))
 }
 
 fn read_scintilla_token(path: &Path) -> Result<String> {
     let token = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read Scintilla daemon token at {}", path.display()))?;
     let token = token.trim();
-    if token.len() < 32 {
+    if token.len() < 32 || token.len() > 4096 || token.chars().any(char::is_whitespace) {
         bail!("Scintilla daemon token is invalid");
     }
     Ok(token.to_owned())
@@ -352,7 +427,7 @@ fn read_scintilla_token(path: &Path) -> Result<String> {
 fn load_or_create_token(path: &Path) -> Result<String> {
     if let Ok(token) = std::fs::read_to_string(path) {
         let token = token.trim();
-        if token.len() >= 32 {
+        if token.len() >= 32 && token.len() <= 4096 && !token.chars().any(char::is_whitespace) {
             return Ok(token.to_owned());
         }
         bail!("IndieBuild daemon token file is too short");
@@ -373,6 +448,35 @@ fn load_or_create_token(path: &Path) -> Result<String> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(token)
+}
+
+async fn read_bounded_json(mut response: reqwest::Response, max_bytes: usize) -> Result<Value> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        bail!("Scintilla response exceeds {max_bytes} bytes");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            bail!("Scintilla response exceeds {max_bytes} bytes");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).context("Scintilla response is not JSON")
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let length = left.len().max(right.len());
+    for index in 0..length {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or_default()
+                ^ right.get(index).copied().unwrap_or_default(),
+        );
+    }
+    difference == 0
 }
 
 fn bad_gateway(error: impl std::fmt::Display) -> (StatusCode, String) {
@@ -417,5 +521,23 @@ mod tests {
         let mut request = valid_request();
         request.repository = "not-a-repository".to_owned();
         assert!(validate_dispatch(&request).is_err());
+    }
+
+    #[test]
+    fn rejects_unsafe_repository_and_ref() {
+        let mut request = valid_request();
+        request.repository = "owner/repo/extra".to_owned();
+        assert!(validate_dispatch(&request).is_err());
+
+        let mut request = valid_request();
+        request.git_ref = "refs/heads/../escape".to_owned();
+        assert!(validate_dispatch(&request).is_err());
+    }
+
+    #[test]
+    fn bearer_comparison_is_length_and_content_sensitive() {
+        assert!(constant_time_eq(b"abcdef", b"abcdef"));
+        assert!(!constant_time_eq(b"abcdef", b"abcdeg"));
+        assert!(!constant_time_eq(b"short", b"shorter"));
     }
 }
