@@ -451,7 +451,8 @@ fn read_token_file(path: &Path, label: &str) -> Result<String> {
 fn load_or_create_token(path: &Path) -> Result<String> {
     match read_token_file(path, "IndieBuild daemon") {
         Ok(token) => return Ok(token),
-        Err(error) if !matches!(fs::symlink_metadata(path), Err(io_error) if io_error.kind() == ErrorKind::NotFound) => {
+        Err(error) if !matches!(fs::symlink_metadata(path), Err(io_error) if io_error.kind() == ErrorKind::NotFound) =>
+        {
             return Err(error);
         }
         Err(_) => {}
