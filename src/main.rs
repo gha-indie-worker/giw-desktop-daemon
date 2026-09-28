@@ -17,7 +17,7 @@ use std::{
 use uuid::Uuid;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8756";
-const DEFAULT_SCINTILLA_URL: &str = "http://127.0.0.1:8750";
+const DEFAULT_SCINTILLA_URL: &str = "http://127.0.0.1:8765";
 const MAX_JOB_TIMEOUT_SECS: u64 = 6 * 60 * 60;
 const MAX_REPOSITORY_CHARS: usize = 256;
 const MAX_REF_CHARS: usize = 256;
@@ -381,4 +381,41 @@ fn bad_gateway(error: impl std::fmt::Display) -> (StatusCode, String) {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_request() -> DispatchJobRequest {
+        DispatchJobRequest {
+            repository: "owner/repo".to_owned(),
+            git_ref: "refs/heads/main".to_owned(),
+            workflow: "ci.yml".to_owned(),
+            job: "test".to_owned(),
+            labels: vec!["linux".to_owned()],
+            timeout_secs: 3600,
+            execution_os: ExecutionOs::Linux,
+        }
+    }
+
+    #[test]
+    fn accepts_bounded_ephemeral_job_intent() {
+        assert!(validate_dispatch(&valid_request()).is_ok());
+    }
+
+    #[test]
+    fn rejects_unbounded_timeout() {
+        let mut request = valid_request();
+        request.timeout_secs = MAX_JOB_TIMEOUT_SECS + 1;
+        assert!(validate_dispatch(&request).is_err());
+    }
+
+    #[test]
+    fn rejects_non_repository_identifier() {
+        let mut request = valid_request();
+        request.repository = "not-a-repository".to_owned();
+        assert!(validate_dispatch(&request).is_err());
+    }
 }
