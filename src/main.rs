@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, HashMap},
-    env, fs,
+    collections::{BTreeMap, HashMap, HashSet},
+    env,
+    fs::{self, OpenOptions},
+    io::{ErrorKind, Write},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
@@ -12,8 +14,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State},
-    http::{HeaderMap, StatusCode, header},
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
+    http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -29,8 +31,20 @@ use uuid::Uuid;
 const PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_BIND: &str = "127.0.0.1:18440";
 const DEFAULT_MANIFEST_FILE: &str = ".giw-desktop.yaml";
+const MAX_HTTP_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_TOKEN_BYTES: usize = 4096;
+const MAX_TOKEN_FILE_BYTES: u64 = (MAX_TOKEN_BYTES + 1) as u64;
+const MAX_SERVICES: usize = 64;
+const MAX_NAME_CHARS: usize = 256;
+const MAX_COMMAND_CHARS: usize = 4096;
+const MAX_ARGS: usize = 128;
+const MAX_ARG_CHARS: usize = 8192;
+const MAX_ENV_ENTRIES: usize = 128;
+const MAX_ENV_VALUE_CHARS: usize = 16_384;
+const MAX_URL_CHARS: usize = 2048;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DesktopManifest {
     #[serde(default = "default_manifest_version")]
     version: u32,
@@ -41,6 +55,7 @@ struct DesktopManifest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ServiceSpec {
     name: String,
     command: String,
@@ -56,6 +71,7 @@ struct ServiceSpec {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TunnelSpec {
     name: String,
     hostname: Option<String>,
@@ -65,6 +81,7 @@ struct TunnelSpec {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateSpec {
     command: String,
     #[serde(default)]
@@ -99,6 +116,7 @@ struct TunnelStatus {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeepAwakeRequest {
     enabled: bool,
 }
@@ -226,14 +244,39 @@ fn validate_manifest(manifest: &DesktopManifest) -> Result<()> {
             manifest.version
         );
     }
+    if manifest.services.len() > MAX_SERVICES {
+        bail!("desktop manifest may declare at most {MAX_SERVICES} services");
+    }
 
-    let mut names = std::collections::HashSet::new();
+    let mut names = HashSet::new();
     for service in &manifest.services {
-        if service.name.trim().is_empty() {
-            bail!("service name may not be empty");
+        if !valid_service_name(&service.name) {
+            bail!("invalid desktop service name {:?}", service.name);
         }
-        if service.command.trim().is_empty() {
-            bail!("service {} has an empty command", service.name);
+        validate_command(&service.command, &service.args, &format!("service {}", service.name))?;
+        if let Some(working_dir) = &service.working_dir {
+            let value = working_dir.to_string_lossy();
+            if value.is_empty() || value.chars().count() > MAX_COMMAND_CHARS {
+                bail!("service {} working_dir is invalid", service.name);
+            }
+        }
+        validate_env_passthrough(&service.env_passthrough, &format!("service {}", service.name))?;
+        if service.env.len() > MAX_ENV_ENTRIES {
+            bail!("service {} declares too many literal environment entries", service.name);
+        }
+        for (key, value) in &service.env {
+            if !valid_env_name(key) {
+                bail!("service {} has invalid environment name {key:?}", service.name);
+            }
+            if looks_secret_bearing(key) {
+                bail!(
+                    "service {} environment {key:?} looks secret-bearing; use env_passthrough or the encrypted secret boundary instead of a literal",
+                    service.name
+                );
+            }
+            if value.chars().count() > MAX_ENV_VALUE_CHARS || value.chars().any(char::is_control) {
+                bail!("service {} environment {key:?} is invalid or too large", service.name);
+            }
         }
         if !names.insert(service.name.clone()) {
             bail!("duplicate service name {}", service.name);
@@ -241,42 +284,142 @@ fn validate_manifest(manifest: &DesktopManifest) -> Result<()> {
     }
 
     if let Some(tunnel) = &manifest.tunnel {
-        if tunnel.name.trim().is_empty() {
-            bail!("tunnel name may not be empty");
+        if tunnel.name.is_empty() || tunnel.name.chars().count() > MAX_NAME_CHARS {
+            bail!("tunnel name is invalid");
+        }
+        if tunnel
+            .hostname
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.chars().count() > 253)
+        {
+            bail!("tunnel hostname is invalid");
         }
         validate_loopback_service_url(&tunnel.service_url)?;
     }
 
-    return Ok(());
-}
-
-fn validate_loopback_service_url(raw: &str) -> Result<()> {
-    let without_scheme = raw
-        .strip_prefix("http://")
-        .context("desktop tunnel service_url must use http://")?;
-    let authority = without_scheme.split('/').next().unwrap_or_default();
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim_matches(['[', ']']);
-
-    let loopback = match host {
-        "localhost" => true,
-        _ => host
-            .parse::<IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false),
-    };
-
-    if !loopback {
-        bail!("desktop tunnel service_url must target loopback; got {raw:?}");
+    if let Some(update) = &manifest.update {
+        validate_command(&update.command, &update.args, "update plan")?;
     }
 
     return Ok(());
 }
 
+fn validate_command(command: &str, args: &[String], context: &str) -> Result<()> {
+    if command.trim().is_empty()
+        || command.chars().count() > MAX_COMMAND_CHARS
+        || command.chars().any(char::is_control)
+    {
+        bail!("{context} command is invalid");
+    }
+    if args.len() > MAX_ARGS {
+        bail!("{context} has too many arguments");
+    }
+    for arg in args {
+        if arg.chars().count() > MAX_ARG_CHARS || arg.chars().any(|character| character == '\0') {
+            bail!("{context} has an invalid or oversized argument");
+        }
+    }
+    return Ok(());
+}
+
+fn validate_env_passthrough(values: &[String], context: &str) -> Result<()> {
+    if values.len() > MAX_ENV_ENTRIES {
+        bail!("{context} declares too many env_passthrough entries");
+    }
+    let mut seen = HashSet::new();
+    for key in values {
+        if !valid_env_name(key) {
+            bail!("{context} has invalid env_passthrough name {key:?}");
+        }
+        if !seen.insert(key.as_str()) {
+            bail!("{context} repeats env_passthrough name {key:?}");
+        }
+    }
+    return Ok(());
+}
+
+fn valid_service_name(value: &str) -> bool {
+    if value.is_empty() || value.chars().count() > MAX_NAME_CHARS {
+        return false;
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return false;
+    }
+    return chars
+        .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || matches!(character, '.' | '_' | '-'));
+}
+
+fn valid_env_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first != '_' && !first.is_ascii_uppercase() {
+        return false;
+    }
+    return chars.all(|character| character == '_' || character.is_ascii_uppercase() || character.is_ascii_digit());
+}
+
+fn looks_secret_bearing(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    return [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PRIVATE",
+        "CREDENTIAL",
+        "API_KEY",
+        "DATABASE_URL",
+        "GH_PAT",
+    ]
+    .iter()
+    .any(|marker| upper.contains(marker));
+}
+
+fn validate_loopback_service_url(raw: &str) -> Result<()> {
+    if raw.chars().count() > MAX_URL_CHARS {
+        bail!("desktop tunnel service_url is too large");
+    }
+    let uri: Uri = raw
+        .parse()
+        .with_context(|| format!("desktop tunnel service_url is not a valid URI: {raw:?}"))?;
+    if uri.scheme_str() != Some("http") {
+        bail!("desktop tunnel service_url must use http://");
+    }
+    let authority = uri
+        .authority()
+        .context("desktop tunnel service_url must include an authority")?;
+    if authority.as_str().contains('@') {
+        bail!("desktop tunnel service_url must not contain credentials/userinfo");
+    }
+    if authority.port_u16().is_none() {
+        bail!("desktop tunnel service_url must include an explicit port");
+    }
+    if uri.query().is_some() || !matches!(uri.path(), "" | "/") {
+        bail!("desktop tunnel service_url must be an unambiguous loopback origin without query or base path");
+    }
+    let host = uri
+        .host()
+        .context("desktop tunnel service_url must include a host")?;
+    let ip: IpAddr = host
+        .parse()
+        .with_context(|| "desktop tunnel service_url host must be a literal loopback IP")?;
+    if !ip.is_loopback() {
+        bail!("desktop tunnel service_url must target a literal loopback IP; got {raw:?}");
+    }
+    return Ok(());
+}
+
 fn load_manifest(path: &Path) -> Result<DesktopManifest> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to stat desktop manifest at {}", path.display()))?;
+    if metadata.len() > 1024 * 1024 {
+        bail!("desktop manifest at {} exceeds 1 MiB", path.display());
+    }
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read desktop manifest at {}", path.display()))?;
     let manifest: DesktopManifest = serde_yaml::from_str(&raw)
@@ -285,16 +428,43 @@ fn load_manifest(path: &Path) -> Result<DesktopManifest> {
     return Ok(manifest);
 }
 
-fn load_or_create_token(path: &Path) -> Result<String> {
-    if let Ok(raw) = fs::read_to_string(path) {
-        let token = raw.trim();
-        if token.len() < 32 || token.chars().any(char::is_whitespace) {
-            bail!(
-                "existing GIW desktop token is malformed at {}",
-                path.display()
-            );
+fn read_existing_token(path: &Path) -> Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(None);
         }
-        return Ok(token.to_string());
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to stat {}", path.display()));
+        }
+    };
+
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("GIW desktop token path must be a regular non-symlink file: {}", path.display());
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_TOKEN_FILE_BYTES {
+        bail!("GIW desktop token file has invalid size at {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("GIW desktop token file must be owner-private (0600 or stricter): {}", path.display());
+        }
+    }
+
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read daemon token at {}", path.display()))?;
+    let token = raw.trim();
+    if token.len() < 32 || token.len() > MAX_TOKEN_BYTES || token.chars().any(char::is_whitespace) {
+        bail!("existing GIW desktop token is malformed at {}", path.display());
+    }
+    return Ok(Some(token.to_string()));
+}
+
+fn load_or_create_token(path: &Path) -> Result<String> {
+    if let Some(token) = read_existing_token(path)? {
+        return Ok(token);
     }
 
     let parent = path
@@ -309,26 +479,48 @@ fn load_or_create_token(path: &Path) -> Result<String> {
         Uuid::new_v4(),
         Uuid::new_v4()
     );
-    fs::write(path, format!("{token}\n"))
-        .with_context(|| format!("failed to write {}", path.display()))?;
-
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to chmod {}", path.display()))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(format!("{token}\n").as_bytes())
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", path.display()))?;
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            return read_existing_token(path)?.context("token path appeared concurrently but was not admissible");
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to create {}", path.display()));
+        }
     }
 
     return Ok(token);
 }
 
+fn constant_time_eq(expected: &[u8], presented: &[u8]) -> bool {
+    let max = expected.len().max(presented.len());
+    let mut diff = (expected.len() ^ presented.len()) as u64;
+    for index in 0..max {
+        let left = expected.get(index).copied().unwrap_or_default();
+        let right = presented.get(index).copied().unwrap_or_default();
+        diff |= u64::from(left ^ right);
+    }
+    return diff == 0;
+}
+
 fn require_auth(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
     let expected = format!("Bearer {}", state.token);
-    let supplied = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
+    let supplied = headers.get(header::AUTHORIZATION).map(|value| value.as_bytes());
 
-    if supplied != Some(expected.as_str()) {
+    if !supplied.is_some_and(|value| constant_time_eq(expected.as_bytes(), value)) {
         return Err(ApiError::unauthorized());
     }
 
@@ -336,6 +528,9 @@ fn require_auth(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
 }
 
 fn service_spec<'a>(state: &'a AppState, name: &str) -> Result<&'a ServiceSpec, ApiError> {
+    if !valid_service_name(name) {
+        return Err(ApiError::bad_request("invalid desktop service name"));
+    }
     if let Some(service) = state
         .manifest
         .services
@@ -350,6 +545,24 @@ fn service_spec<'a>(state: &'a AppState, name: &str) -> Result<&'a ServiceSpec, 
     )));
 }
 
+fn apply_minimal_environment(command: &mut Command) {
+    command.env_clear();
+    for baseline in [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+    ] {
+        if let Some(value) = env::var_os(baseline) {
+            command.env(baseline, value);
+        }
+    }
+}
+
 fn command_for_service(service: &ServiceSpec) -> Command {
     let mut command = Command::new(&service.command);
     command.args(&service.args);
@@ -358,21 +571,14 @@ fn command_for_service(service: &ServiceSpec) -> Command {
         command.current_dir(working_dir);
     }
 
-    if !service.env_passthrough.is_empty() || !service.env.is_empty() {
-        command.env_clear();
-        for baseline in ["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP"] {
-            if let Some(value) = env::var_os(baseline) {
-                command.env(baseline, value);
-            }
-        }
-        for key in &service.env_passthrough {
-            if let Some(value) = env::var_os(key) {
-                command.env(key, value);
-            }
-        }
-        for (key, value) in &service.env {
+    apply_minimal_environment(&mut command);
+    for key in &service.env_passthrough {
+        if let Some(value) = env::var_os(key) {
             command.env(key, value);
         }
+    }
+    for (key, value) in &service.env {
+        command.env(key, value);
     }
 
     command.stdin(Stdio::null());
@@ -567,6 +773,7 @@ async fn start_tunnel(
         "run",
         spec.name.as_str(),
     ]);
+    apply_minimal_environment(&mut command);
     command.stdin(Stdio::null());
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
@@ -602,6 +809,7 @@ fn keep_awake_command() -> Result<Command, ApiError> {
     {
         let mut command = Command::new("caffeinate");
         command.args(["-d", "-i", "-m", "-s", "-u"]);
+        apply_minimal_environment(&mut command);
         return Ok(command);
     }
 
@@ -615,6 +823,7 @@ fn keep_awake_command() -> Result<Command, ApiError> {
             "sleep",
             "infinity",
         ]);
+        apply_minimal_environment(&mut command);
         return Ok(command);
     }
 
@@ -660,8 +869,10 @@ async fn apply_update(
         .as_ref()
         .ok_or_else(|| ApiError::not_found("desktop manifest has no update plan"))?;
 
-    let status = Command::new(&update.command)
-        .args(&update.args)
+    let mut command = Command::new(&update.command);
+    command.args(&update.args);
+    apply_minimal_environment(&mut command);
+    let status = command
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -723,6 +934,23 @@ async fn reconcile(
     })));
 }
 
+async fn shutdown_children(state: &AppState) {
+    let children = {
+        let mut processes = state.processes.lock().await;
+        processes.drain().map(|(_, child)| child).collect::<Vec<_>>()
+    };
+    for mut child in children {
+        let _ = child.kill().await;
+    }
+
+    if let Some(mut child) = state.tunnel.lock().await.take() {
+        let _ = child.kill().await;
+    }
+    if let Some(mut child) = state.keep_awake.lock().await.take() {
+        let _ = child.kill().await;
+    }
+}
+
 fn router(state: Arc<AppState>) -> Router {
     return Router::new()
         .route("/healthz", get(healthz))
@@ -736,6 +964,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/v1/power/keep-awake", post(set_keep_awake))
         .route("/v1/updates/apply", post(apply_update))
         .route("/v1/reconcile", post(reconcile))
+        .layer(DefaultBodyLimit::max(MAX_HTTP_REQUEST_BYTES))
         .with_state(state);
 }
 
@@ -768,12 +997,13 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("failed to bind GIW desktop daemon to {bind}"))?;
-    axum::serve(listener, router(state))
+    let serve_result = axum::serve(listener, router(state.clone()))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
-        .await
-        .context("GIW desktop daemon failed")?;
+        .await;
+    shutdown_children(&state).await;
+    serve_result.context("GIW desktop daemon failed")?;
 
     return Ok(());
 }
@@ -785,13 +1015,20 @@ mod tests {
     #[test]
     fn control_bind_must_be_loopback() {
         assert!(validate_loopback_bind("127.0.0.1:18440").is_ok());
+        assert!(validate_loopback_bind("[::1]:18440").is_ok());
         assert!(validate_loopback_bind("0.0.0.0:18440").is_err());
     }
 
     #[test]
-    fn tunnel_origin_must_be_loopback_http() {
+    fn tunnel_origin_must_be_literal_loopback_http() {
         assert!(validate_loopback_service_url("http://127.0.0.1:8080").is_ok());
+        assert!(validate_loopback_service_url("http://[::1]:8080").is_ok());
         assert!(validate_loopback_service_url("https://127.0.0.1:8080").is_err());
+        assert!(validate_loopback_service_url("http://localhost:8080").is_err());
+        assert!(validate_loopback_service_url("http://user@127.0.0.1:8080").is_err());
+        assert!(validate_loopback_service_url("http://127.0.0.1:8080/path").is_err());
+        assert!(validate_loopback_service_url("http://127.0.0.1:8080?x=1").is_err());
+        assert!(validate_loopback_service_url("http://127.0.0.1").is_err());
         assert!(validate_loopback_service_url("http://example.com:8080").is_err());
     }
 
@@ -813,5 +1050,50 @@ mod tests {
             update: None,
         };
         assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_secret_bearing_literal_environment() {
+        let mut env = BTreeMap::new();
+        env.insert("API_TOKEN".to_string(), "not-a-real-secret".to_string());
+        let service = ServiceSpec {
+            name: "worker".to_string(),
+            command: "worker".to_string(),
+            args: Vec::new(),
+            working_dir: None,
+            env_passthrough: Vec::new(),
+            env,
+            autostart: false,
+        };
+        let manifest = DesktopManifest {
+            version: 1,
+            services: vec![service],
+            tunnel: None,
+            update: None,
+        };
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn token_compare_rejects_mismatch_and_length_change() {
+        assert!(constant_time_eq(b"Bearer abc", b"Bearer abc"));
+        assert!(!constant_time_eq(b"Bearer abc", b"Bearer abd"));
+        assert!(!constant_time_eq(b"Bearer abc", b"Bearer abc0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_token_is_owner_private_and_regular() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("token");
+        let token = load_or_create_token(&path).expect("token creation");
+        assert!(token.len() >= 32);
+        let metadata = fs::symlink_metadata(&path).expect("metadata");
+        assert!(metadata.file_type().is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        assert_eq!(load_or_create_token(&path).expect("token reload"), token);
     }
 }
