@@ -318,13 +318,17 @@ fn safe_repo_segment(value: &str, max: usize) -> bool {
 
 fn validate_git_ref(value: &str) -> Result<(), (StatusCode, String)> {
     validate_bounded("git_ref", value, MAX_REF_CHARS)?;
+    let forbidden = ['~', '^', ':', '?', '*', '[', '\\'];
     if value.starts_with('/')
+        || value.starts_with('-')
         || value.ends_with('/')
+        || value.ends_with('.')
+        || value.ends_with(".lock")
         || value.contains("//")
         || value.contains("..")
         || value.contains("@{")
-        || value.contains('\\')
         || value.chars().any(char::is_whitespace)
+        || value.chars().any(|ch| forbidden.contains(&ch))
     {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -422,8 +426,14 @@ fn require_loopback_url(value: &str) -> Result<()> {
         bail!("GIW_SCINTILLA_DAEMON_URL must be credential-free loopback HTTP");
     }
     let host = url.host_str().unwrap_or_default();
-    if !matches!(host, "127.0.0.1" | "::1") {
+    if !matches!(host, "127.0.0.1" | "::1" | "[::1]") {
         bail!("GIW_SCINTILLA_DAEMON_URL must use a literal loopback address");
+    }
+    if url.port().is_none() {
+        bail!("GIW_SCINTILLA_DAEMON_URL must include an explicit port");
+    }
+    if !matches!(url.path(), "" | "/") {
+        bail!("GIW_SCINTILLA_DAEMON_URL must be a root origin without a path");
     }
     return Ok(());
 }
@@ -629,6 +639,28 @@ mod tests {
         let mut request = valid_request();
         request.git_ref = "refs/heads/../escape".to_owned();
         assert!(validate_dispatch(&request).is_err());
+
+        for unsafe_ref in [
+            "--help",
+            "refs/heads/a~1",
+            "refs/heads/a^1",
+            "refs/heads/a:b",
+            "refs/heads/a.lock",
+        ] {
+            let mut request = valid_request();
+            request.git_ref = unsafe_ref.to_owned();
+            assert!(validate_dispatch(&request).is_err(), "{unsafe_ref}");
+        }
+    }
+
+    #[test]
+    fn scintilla_origin_requires_literal_loopback_explicit_port_and_root_path() {
+        assert!(require_loopback_url("http://127.0.0.1:8765").is_ok());
+        assert!(require_loopback_url("http://[::1]:8765/").is_ok());
+        assert!(require_loopback_url("http://127.0.0.1").is_err());
+        assert!(require_loopback_url("http://127.0.0.1:8765/prefix").is_err());
+        assert!(require_loopback_url("http://127.0.0.1:8765@evil.example").is_err());
+        assert!(require_loopback_url("http://localhost:8765").is_err());
     }
 
     #[test]
