@@ -595,7 +595,13 @@ mod tests {
         request.git_ref = "refs/heads/../escape".to_owned();
         assert!(validate_dispatch(&request).is_err());
 
-        for unsafe_ref in ["--help", "refs/heads/a~1", "refs/heads/a^1", "refs/heads/a:b", "refs/heads/a.lock"] {
+        for unsafe_ref in [
+            "--help",
+            "refs/heads/a~1",
+            "refs/heads/a^1",
+            "refs/heads/a:b",
+            "refs/heads/a.lock",
+        ] {
             let mut request = valid_request();
             request.git_ref = unsafe_ref.to_owned();
             assert!(validate_dispatch(&request).is_err(), "{unsafe_ref}");
