@@ -385,7 +385,7 @@ fn require_loopback_url(value: &str) -> Result<()> {
         bail!("GIW_SCINTILLA_DAEMON_URL must be credential-free loopback HTTP");
     }
     let host = url.host_str().unwrap_or_default();
-    if !matches!(host, "127.0.0.1" | "::1") {
+    if !matches!(host, "127.0.0.1" | "::1" | "[::1]") {
         bail!("GIW_SCINTILLA_DAEMON_URL must use a literal loopback address");
     }
     if url.port().is_none() {
