@@ -1,0 +1,36 @@
+[identity]
+service = "giw-desktop-daemon"
+type_name = "DaemonEnv"
+
+[help]
+url = "https://github.com/gha-indie-worker/giw-desktop-daemon"
+
+[parse]
+allow_unknown = false
+
+[env]
+ignore = [
+  "GIW_DESKTOP_TOKEN_FILE",
+  "GIW_SCINTILLA_TOKEN_FILE"
+]
+
+[flags.listen]
+env = "GIW_DESKTOP_ADDR"
+aliases = ["listen"]
+type = "string"
+default = "127.0.0.1:8770"
+help = "Loopback-only GIW desktop daemon listen address."
+
+[flags.scintilla-url]
+env = "GIW_SCINTILLA_DAEMON_URL"
+aliases = ["scintilla-url"]
+type = "string"
+default = "http://127.0.0.1:8765"
+help = "Loopback Scintilla desktop daemon URL."
+
+[flags.log-filter]
+env = "RUST_LOG"
+aliases = ["log-filter"]
+type = "string"
+default = "giw_desktop_daemon=info"
+help = "Tracing filter."
