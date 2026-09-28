@@ -51,7 +51,12 @@ pub fn apply_cli_flags() -> Result<EnvMap, String> {
         ));
     }
 
+    // Contract defaults are parser metadata, not explicit operator input.
+    // Preserve the fleet precedence rule: schema defaults < process env < argv.
+    // `provided_flags` contains only values explicitly supplied through argv,
+    // whereas `flags` also carries TOML defaults and would silently overwrite
+    // real environment values when extended over `initial`.
     let mut env = initial;
-    env.extend(parsed.flags);
+    env.extend(parsed.provided_flags);
     Ok(env)
 }
