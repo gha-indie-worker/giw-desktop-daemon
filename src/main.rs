@@ -14,7 +14,10 @@ use std::{
     io::{ErrorKind, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 use uuid::Uuid;
@@ -27,6 +30,7 @@ const MAX_REF_CHARS: usize = 256;
 const MAX_JOB_NAME_CHARS: usize = 128;
 const MAX_UPSTREAM_BODY_BYTES: usize = 1024 * 1024;
 const MAX_TOKEN_FILE_BYTES: u64 = 4096;
+const MAX_IN_FLIGHT_DISPATCHES: usize = 32;
 
 #[derive(Clone)]
 struct AppState {
@@ -34,7 +38,18 @@ struct AppState {
     scintilla_token: Arc<str>,
     scintilla_url: Arc<str>,
     client: reqwest::Client,
+    in_flight_dispatches: Arc<AtomicUsize>,
     started_at: Instant,
+}
+
+struct DispatchPermit {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for DispatchPermit {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -43,6 +58,8 @@ struct StatusResponse {
     execution_backend: &'static str,
     isolation: &'static str,
     worker_reuse: &'static str,
+    in_flight_dispatches: usize,
+    max_in_flight_dispatches: usize,
     uptime_ms: u128,
     scintilla: Value,
 }
@@ -108,6 +125,7 @@ async fn main() -> Result<()> {
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
+        in_flight_dispatches: Arc::new(AtomicUsize::new(0)),
         started_at: Instant::now(),
     };
 
@@ -124,11 +142,11 @@ async fn main() -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    Ok(())
+    return Ok(());
 }
 
 async fn health() -> &'static str {
-    "ok"
+    return "ok";
 }
 
 async fn status(
@@ -137,14 +155,16 @@ async fn status(
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
     authorize(&headers, &state)?;
     let scintilla = fetch_scintilla_status(&state).await?;
-    Ok(Json(StatusResponse {
+    return Ok(Json(StatusResponse {
         product: "indiebuild",
         execution_backend: "scintilla-run",
         isolation: "ephemeral-per-job",
         worker_reuse: "forbidden",
+        in_flight_dispatches: state.in_flight_dispatches.load(Ordering::Acquire),
+        max_in_flight_dispatches: MAX_IN_FLIGHT_DISPATCHES,
         uptime_ms: state.started_at.elapsed().as_millis(),
         scintilla,
-    }))
+    }));
 }
 
 async fn scintilla_status(
@@ -152,7 +172,7 @@ async fn scintilla_status(
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     authorize(&headers, &state)?;
-    fetch_scintilla_status(&state).await.map(Json)
+    return fetch_scintilla_status(&state).await.map(Json);
 }
 
 async fn dispatch_job(
@@ -162,6 +182,7 @@ async fn dispatch_job(
 ) -> Result<Json<DispatchJobResponse>, (StatusCode, String)> {
     authorize(&headers, &state)?;
     validate_dispatch(&request)?;
+    let _dispatch_permit = try_reserve_dispatch(&state.in_flight_dispatches)?;
 
     let execution_id = format!("giw-{}", Uuid::new_v4().simple());
     let payload = json!({
@@ -204,12 +225,32 @@ async fn dispatch_job(
         .await
         .map_err(bad_gateway)?;
 
-    Ok(Json(DispatchJobResponse {
+    return Ok(Json(DispatchJobResponse {
         execution_id,
         backend: "scintilla-run",
         ephemeral: true,
         raw,
-    }))
+    }));
+}
+
+fn try_reserve_dispatch(
+    counter: &Arc<AtomicUsize>,
+) -> Result<DispatchPermit, (StatusCode, String)> {
+    let reserved = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        if current < MAX_IN_FLIGHT_DISPATCHES {
+            return Some(current + 1);
+        }
+        return None;
+    });
+    if reserved.is_err() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "IndieBuild desktop dispatch capacity is exhausted".to_owned(),
+        ));
+    }
+    return Ok(DispatchPermit {
+        counter: counter.clone(),
+    });
 }
 
 fn validate_dispatch(request: &DispatchJobRequest) -> Result<(), (StatusCode, String)> {
@@ -234,7 +275,7 @@ fn validate_dispatch(request: &DispatchJobRequest) -> Result<(), (StatusCode, St
     for label in &request.labels {
         validate_label(label)?;
     }
-    Ok(())
+    return Ok(());
 }
 
 fn validate_bounded(name: &str, value: &str, max_chars: usize) -> Result<(), (StatusCode, String)> {
@@ -247,7 +288,7 @@ fn validate_bounded(name: &str, value: &str, max_chars: usize) -> Result<(), (St
             format!("{name} is empty, too long, or contains control characters"),
         ));
     }
-    Ok(())
+    return Ok(());
 }
 
 fn validate_repository(value: &str) -> Result<(), (StatusCode, String)> {
@@ -264,15 +305,15 @@ fn validate_repository(value: &str) -> Result<(), (StatusCode, String)> {
             "repository must be a safe owner/name identifier".to_owned(),
         ));
     }
-    Ok(())
+    return Ok(());
 }
 
 fn safe_repo_segment(value: &str, max: usize) -> bool {
-    !value.is_empty()
+    return !value.is_empty()
         && value.len() <= max
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
 }
 
 fn validate_git_ref(value: &str) -> Result<(), (StatusCode, String)> {
@@ -290,7 +331,7 @@ fn validate_git_ref(value: &str) -> Result<(), (StatusCode, String)> {
             "git_ref contains unsafe ref syntax".to_owned(),
         ));
     }
-    Ok(())
+    return Ok(());
 }
 
 fn validate_pathish(name: &str, value: &str, max_chars: usize) -> Result<(), (StatusCode, String)> {
@@ -305,7 +346,7 @@ fn validate_pathish(name: &str, value: &str, max_chars: usize) -> Result<(), (St
             format!("{name} contains unsafe path syntax"),
         ));
     }
-    Ok(())
+    return Ok(());
 }
 
 fn validate_label(value: &str) -> Result<(), (StatusCode, String)> {
@@ -319,11 +360,11 @@ fn validate_label(value: &str) -> Result<(), (StatusCode, String)> {
             "label contains unsupported characters".to_owned(),
         ));
     }
-    Ok(())
+    return Ok(());
 }
 
 fn default_timeout_secs() -> u64 {
-    60 * 60
+    return 60 * 60;
 }
 
 async fn fetch_scintilla_status(state: &AppState) -> Result<Value, (StatusCode, String)> {
@@ -344,9 +385,9 @@ async fn fetch_scintilla_status(state: &AppState) -> Result<Value, (StatusCode, 
             format!("Scintilla desktop daemon returned {status}"),
         ));
     }
-    read_bounded_json(response, MAX_UPSTREAM_BODY_BYTES)
+    return read_bounded_json(response, MAX_UPSTREAM_BODY_BYTES)
         .await
-        .map_err(bad_gateway)
+        .map_err(bad_gateway);
 }
 
 fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
@@ -357,7 +398,7 @@ fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, S
     if provided.is_some_and(|token| constant_time_eq(token.as_bytes(), state.token.as_bytes())) {
         return Ok(());
     }
-    Err((StatusCode::UNAUTHORIZED, "unauthorized".to_owned()))
+    return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_owned()));
 }
 
 fn parse_loopback_addr(value: &str) -> Result<SocketAddr> {
@@ -367,7 +408,7 @@ fn parse_loopback_addr(value: &str) -> Result<SocketAddr> {
     if !addr.ip().is_loopback() {
         bail!("GIW_DESKTOP_ADDR must bind to loopback");
     }
-    Ok(addr)
+    return Ok(addr);
 }
 
 fn require_loopback_url(value: &str) -> Result<()> {
@@ -384,21 +425,21 @@ fn require_loopback_url(value: &str) -> Result<()> {
     if !matches!(host, "127.0.0.1" | "::1") {
         bail!("GIW_SCINTILLA_DAEMON_URL must use a literal loopback address");
     }
-    Ok(())
+    return Ok(());
 }
 
 fn giw_token_path(env: &flags::EnvMap) -> Result<PathBuf> {
     if let Some(path) = env.get("GIW_DESKTOP_TOKEN_FILE") {
         return expand_home(Path::new(path));
     }
-    Ok(home_dir()?.join(".indiebuild/daemon/token"))
+    return Ok(home_dir()?.join(".indiebuild/daemon/token"));
 }
 
 fn scintilla_token_path(env: &flags::EnvMap) -> Result<PathBuf> {
     if let Some(path) = env.get("GIW_SCINTILLA_TOKEN_FILE") {
         return expand_home(Path::new(path));
     }
-    Ok(home_dir()?.join(".scintilla/daemon/token"))
+    return Ok(home_dir()?.join(".scintilla/daemon/token"));
 }
 
 fn expand_home(path: &Path) -> Result<PathBuf> {
@@ -407,18 +448,18 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
         let suffix = text.trim_start_matches('~').trim_start_matches('/');
         return Ok(home_dir()?.join(suffix));
     }
-    Ok(path.to_path_buf())
+    return Ok(path.to_path_buf());
 }
 
 fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
+    return std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("HOME/USERPROFILE is required"))
+        .ok_or_else(|| anyhow!("HOME/USERPROFILE is required"));
 }
 
 fn read_scintilla_token(path: &Path) -> Result<String> {
-    read_token_file(path, "Scintilla daemon")
+    return read_token_file(path, "Scintilla daemon");
 }
 
 fn read_token_file(path: &Path, label: &str) -> Result<String> {
@@ -445,13 +486,17 @@ fn read_token_file(path: &Path, label: &str) -> Result<String> {
     if token.len() < 32 || token.len() > 4096 || token.chars().any(char::is_whitespace) {
         bail!("{label} token is invalid");
     }
-    Ok(token.to_owned())
+    return Ok(token.to_owned());
 }
 
 fn load_or_create_token(path: &Path) -> Result<String> {
     match read_token_file(path, "IndieBuild daemon") {
         Ok(token) => return Ok(token),
-        Err(error) if !matches!(fs::symlink_metadata(path), Err(io_error) if io_error.kind() == ErrorKind::NotFound) =>
+        Err(error)
+            if !matches!(
+                fs::symlink_metadata(path),
+                Err(io_error) if io_error.kind() == ErrorKind::NotFound
+            ) =>
         {
             return Err(error);
         }
@@ -517,7 +562,7 @@ async fn read_bounded_json(mut response: reqwest::Response, max_bytes: usize) ->
         }
         bytes.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&bytes).context("Scintilla response is not JSON")
+    return serde_json::from_slice(&bytes).context("Scintilla response is not JSON");
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -529,11 +574,11 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
                 ^ right.get(index).copied().unwrap_or_default(),
         );
     }
-    difference == 0
+    return difference == 0;
 }
 
 fn bad_gateway(error: impl std::fmt::Display) -> (StatusCode, String) {
-    (StatusCode::BAD_GATEWAY, error.to_string())
+    return (StatusCode::BAD_GATEWAY, error.to_string());
 }
 
 async fn shutdown_signal() {
@@ -545,7 +590,7 @@ mod tests {
     use super::*;
 
     fn valid_request() -> DispatchJobRequest {
-        DispatchJobRequest {
+        return DispatchJobRequest {
             repository: "owner/repo".to_owned(),
             git_ref: "refs/heads/main".to_owned(),
             workflow: "ci.yml".to_owned(),
@@ -553,7 +598,7 @@ mod tests {
             labels: vec!["linux".to_owned()],
             timeout_secs: 3600,
             execution_os: ExecutionOs::Linux,
-        }
+        };
     }
 
     #[test]
@@ -591,6 +636,20 @@ mod tests {
         assert!(constant_time_eq(b"abcdef", b"abcdef"));
         assert!(!constant_time_eq(b"abcdef", b"abcdeg"));
         assert!(!constant_time_eq(b"short", b"shorter"));
+    }
+
+    #[test]
+    fn dispatch_backpressure_is_strict_and_releases_capacity() {
+        let counter = Arc::new(AtomicUsize::new(MAX_IN_FLIGHT_DISPATCHES - 1));
+        let permit = try_reserve_dispatch(&counter);
+        assert!(permit.is_ok());
+        assert_eq!(counter.load(Ordering::Acquire), MAX_IN_FLIGHT_DISPATCHES);
+        assert!(try_reserve_dispatch(&counter).is_err());
+        drop(permit);
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            MAX_IN_FLIGHT_DISPATCHES - 1
+        );
     }
 
     #[cfg(unix)]
