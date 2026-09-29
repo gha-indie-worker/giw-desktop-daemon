@@ -25,3 +25,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+ores-common-desktop-ipc = { git = "https://github.com/ORESoftware/ores-common-desktop-infra.git", rev = "6fdc2f1b28083942a403fffbaa9b695fda6d9b76", package = "ores-common-desktop-ipc" }
