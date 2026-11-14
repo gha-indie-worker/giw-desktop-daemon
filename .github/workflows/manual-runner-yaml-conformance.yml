@@ -1,0 +1,60 @@
+# Manually invoked, source-free verification of GitHub Actions runner semantics.
+# No checkout, third-party actions, secrets, or pull_request trigger.
+name: Manual runner YAML conformance
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner lane to validate (never selected by PR content)
+        required: true
+        type: choice
+        default: self-hosted-linux
+        options:
+          - self-hosted-linux
+          - self-hosted-macos
+          - github-hosted-ubuntu
+permissions: {}
+concurrency:
+  group: runner-yaml-conformance-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  probe:
+    runs-on: ${{ fromJSON(inputs.runner == 'self-hosted-macos' && '["self-hosted","macOS"]' || inputs.runner == 'github-hosted-ubuntu' && '"ubuntu-24.04"' || '["self-hosted","Linux"]') }}
+    timeout-minutes: 5
+    outputs:
+      ready: ${{ steps.emit.outputs.ready }}
+    steps:
+      - name: Verify isolated runner context
+        shell: bash
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test -d "$GITHUB_WORKSPACE"
+          test -d "$RUNNER_TEMP"
+      - name: Emit step and job output
+        id: emit
+        shell: bash
+        run: printf 'ready=true\n' >> "$GITHUB_OUTPUT"
+  verify:
+    needs: probe
+    runs-on: ${{ fromJSON(inputs.runner == 'self-hosted-macos' && '["self-hosted","macOS"]' || inputs.runner == 'github-hosted-ubuntu' && '"ubuntu-24.04"' || '["self-hosted","Linux"]') }}
+    timeout-minutes: 5
+    steps:
+      - name: Evaluate needs and conditional steps
+        id: conditional
+        if: ${{ needs.probe.outputs.ready == 'true' }}
+        shell: bash
+        run: printf 'passed=yes\n' >> "$GITHUB_OUTPUT"
+      - name: Enforce dependency and conditional outputs
+        shell: bash
+        env:
+          PROBE_READY: ${{ needs.probe.outputs.ready }}
+          CONDITION_PASSED: ${{ steps.conditional.outputs.passed }}
+        run: |
+          set -euo pipefail
+          test "$PROBE_READY" = true
+          test "$CONDITION_PASSED" = yes
+          printf 'Runner YAML conformance passed on %s\n' "$RUNNER_OS" >> "$GITHUB_STEP_SUMMARY"
